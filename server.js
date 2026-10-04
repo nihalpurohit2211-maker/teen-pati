@@ -6,10 +6,41 @@ const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST', 'OPTIONS']
+  }
+});
+
+// Express CORS Middleware
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  next();
+});
+
+// HTTP /health & /ping Endpoints (MUST be placed before /:code)
+const healthHandler = (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
+  });
+};
+app.get('/health', healthHandler);
+app.get('/ping', healthHandler);
 
 app.use(express.static(path.join(__dirname, 'public')));
-app.get('/:code', (req, res) => { res.sendFile(path.join(__dirname, 'public', 'index.html')); });
+app.get('/:code', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
 const rooms = new Map();
 
@@ -27,6 +58,7 @@ function publicRoomState(room) {
   const state = { ...room };
   delete state.deck;
   delete state.turnTimer;
+  delete state.sideshowTimer;
   state.players = state.players.map(p => {
     const pCopy = { ...p };
     if (pCopy.hand) {
@@ -74,7 +106,7 @@ function advanceTurn(room, io) {
   const options = {
     canCall: true, canRaise: true, canFold: true,
     canShow: activeCount === 2 && p.state === 'seen',
-    canSideshow: gameEngine.canSideshow(room, p.id),
+    canSideshow: activeCount >= 3 && gameEngine.canSideshow(room, p.id),
     isBlind: p.state === 'blind',
     currentBet: room.currentBet,
     callAmount: gameEngine.getMinBet(p.state === 'blind', room.currentBet),
@@ -82,13 +114,16 @@ function advanceTurn(room, io) {
     myChips: p.chips,
   };
   
-  io.to(p.id).emit('game:yourTurn', { options, timeLimit: 35 });
+  io.to(p.id).emit('game:yourTurn', { options, timeLimit: 35, turnTime: 35 });
   io.to(room.code).emit('room:updated', publicRoomState(room));
   startTurnTimer(room, io);
 }
 
 function endRound(room, io, winnerId) {
   clearTurnTimer(room);
+  clearSideshowTimer(room);
+  room.sideshowPending = null;
+
   let winner = winnerId ? room.players.find(p => p.id === winnerId) : gameEngine.getWinner(room.players);
   if (winner) winner.chips += room.pot;
 
@@ -108,25 +143,39 @@ function endRound(room, io, winnerId) {
   
   for (let i = room.players.length - 1; i >= 0; i--) {
     const p = room.players[i];
-    if (p.chips <= 0) {
+    if (p.chips <= 0 || !p.connected) {
       room.players.splice(i, 1);
-      io.to(p.id).emit('room:error', { message: 'You are out of chips!' });
+      io.to(p.id).emit('room:error', { message: 'You are out of chips or disconnected!' });
     } else {
-      p.state = 'blind'; p.currentRoundBet = 0; p.hand = []; p.ready = false;
+      p.state = 'blind';
+      p.currentRoundBet = 0;
+      p.hand = [];
+      p.ready = true; // Seated survivors default to ready for subsequent round rematch
     }
   }
+
+  // If previous host was eliminated, reassign host to first remaining player
+  if (room.players.length > 0 && !room.players.some(p => p.id === room.host)) {
+    room.host = room.players[0].id;
+  }
   
-  if (room.players.length === 0) rooms.delete(room.code);
-  else io.to(room.code).emit('room:updated', publicRoomState(room));
+  if (room.players.length === 0) {
+    rooms.delete(room.code);
+  } else {
+    io.to(room.code).emit('room:updated', publicRoomState(room));
+  }
 }
 
 io.on('connection', (socket) => {
-  socket.on('room:create', ({ name }) => {
-    if (!name || name.length > 20) return socket.emit('room:error', { message: 'Invalid name' });
+  socket.on('room:create', (data) => {
+    const payload = (data && typeof data === 'object') ? data : {};
+    const cleanName = typeof payload.name === 'string' ? payload.name.trim() : '';
+    if (!cleanName) return socket.emit('room:error', { message: 'Player name is required' });
+    if (cleanName.length > 20) return socket.emit('room:error', { message: 'Invalid name' });
     const code = generateRoomCode();
     const room = {
       code, host: socket.id, phase: 'waiting', settings: { startingChips: 1000, boot: 50 },
-      players: [{ id: socket.id, name, chips: 1000, hand: [], state: 'blind', currentRoundBet: 0, ready: false, seatIndex: 0, connected: true }],
+      players: [{ id: socket.id, name: cleanName, chips: 1000, hand: [], state: 'blind', currentRoundBet: 0, ready: false, seatIndex: 0, connected: true }],
       deck: [], pot: 0, currentBet: 50, currentPlayerIndex: 0, turnTimer: null, roundNumber: 0, sideshowPending: null
     };
     rooms.set(code, room);
@@ -135,19 +184,35 @@ io.on('connection', (socket) => {
     io.to(code).emit('room:updated', publicRoomState(room));
   });
 
-  socket.on('room:join', ({ code, name }) => {
-    const room = rooms.get(code);
+  socket.on('room:join', (data) => {
+    const payload = (data && typeof data === 'object') ? data : {};
+    const cleanCode = typeof payload.code === 'string' ? payload.code.toUpperCase().trim() : (typeof payload.code === 'number' ? String(payload.code).trim() : '');
+    const cleanName = typeof payload.name === 'string' ? payload.name.trim() : '';
+    if (!cleanName) return socket.emit('room:error', { message: 'Player name is required' });
+    if (cleanName.length > 20) return socket.emit('room:error', { message: 'Invalid name' });
+    const room = rooms.get(cleanCode);
     if (!room) return socket.emit('room:error', { message: 'Room not found' });
     if (room.players.length >= 6) return socket.emit('room:error', { message: 'Room full' });
     if (room.phase !== 'waiting') return socket.emit('room:error', { message: 'Game in progress' });
-    if (room.players.find(p => p.name === name)) return socket.emit('room:error', { message: 'Name taken' });
-    room.players.push({ id: socket.id, name, chips: room.settings.startingChips, hand: [], state: 'blind', currentRoundBet: 0, ready: false, seatIndex: room.players.length, connected: true });
-    socket.join(code);
+    if (room.players.find(p => p.name === cleanName)) return socket.emit('room:error', { message: 'Name taken' });
+    room.players.push({
+      id: socket.id,
+      name: cleanName,
+      chips: room.settings.startingChips,
+      hand: [],
+      state: 'blind',
+      currentRoundBet: 0,
+      ready: false,
+      seatIndex: room.players.length,
+      connected: true
+    });
+    socket.join(room.code);
     socket.emit('room:joined', { room: publicRoomState(room), playerId: socket.id, isHost: false });
-    io.to(code).emit('room:updated', publicRoomState(room));
+    io.to(room.code).emit('room:updated', publicRoomState(room));
   });
 
-  socket.on('room:ready', () => {
+  socket.on('room:ready', (data) => {
+    const payload = (data && typeof data === 'object') ? data : {};
     for (const room of rooms.values()) {
       const p = room.players.find(p => p.id === socket.id);
       if (p && room.phase === 'waiting') {
@@ -158,11 +223,15 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('room:settings', ({ startingChips, boot }) => {
+  socket.on('room:settings', (data) => {
+    const payload = (data && typeof data === 'object') ? data : {};
+    const startingChips = Number(payload.startingChips !== undefined ? payload.startingChips : payload.chips);
+    const boot = Number(payload.boot !== undefined ? payload.boot : payload.bootAmount);
     for (const room of rooms.values()) {
       if (room.host === socket.id && room.phase === 'waiting') {
-        if (startingChips >= 100 && startingChips <= 100000 && boot >= 10 && boot <= 10000) {
-          room.settings.startingChips = startingChips; room.settings.boot = boot;
+        if (!isNaN(startingChips) && !isNaN(boot) && startingChips >= 100 && startingChips <= 100000 && boot >= 10 && boot <= 10000) {
+          room.settings.startingChips = startingChips;
+          room.settings.boot = boot;
           room.players.forEach(p => p.chips = startingChips);
           io.to(room.code).emit('room:updated', publicRoomState(room));
         }
@@ -174,8 +243,17 @@ io.on('connection', (socket) => {
   socket.on('game:start', () => {
     for (const room of rooms.values()) {
       if (room.host === socket.id && room.phase === 'waiting') {
-        if (room.players.length < 3) return socket.emit('room:error', { message: 'Need at least 3 players' });
-        if (!room.players.filter(p => p.id !== room.host).every(p => p.ready)) return socket.emit('room:error', { message: 'Not all players ready' });
+        if (room.players.length < 2) return socket.emit('room:error', { message: 'Need at least 2 players' });
+        
+        const nonHosts = room.players.filter(p => p.id !== room.host);
+        if (!nonHosts.every(p => p.ready)) {
+          if (room.roundNumber > 0) {
+            // Rematch: auto-ready remaining seated players
+            nonHosts.forEach(p => p.ready = true);
+          } else {
+            return socket.emit('room:error', { message: 'Not all players ready' });
+          }
+        }
         
         room.phase = 'betting';
         const deal = gameEngine.dealHands(room.players.length);
@@ -190,6 +268,7 @@ io.on('connection', (socket) => {
         });
         
         room.currentBet = room.settings.boot; room.currentPlayerIndex = 0;
+        io.to(room.code).emit('game:started', { publicState: publicRoomState(room) });
         room.players.forEach(p => io.to(p.id).emit('game:dealt', { hand: p.hand, publicState: publicRoomState(room) }));
         advanceTurn(room, io);
         break;
@@ -208,7 +287,10 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('game:action', ({ type, amount }) => {
+  socket.on('game:action', (data) => {
+    const payload = (data && typeof data === 'object') ? data : {};
+    const type = typeof payload.type === 'string' ? payload.type : '';
+    const amount = payload.amount;
     for (const room of rooms.values()) {
       const p = room.players[room.currentPlayerIndex];
       if (room.phase === 'betting' && p && p.id === socket.id) {
@@ -229,14 +311,29 @@ io.on('connection', (socket) => {
         } else if (type === 'raise') {
           const minRaise = room.currentBet * 2;
           const cost = p.state === 'blind' ? amount : amount * 2;
-          if (amount >= minRaise && cost <= p.chips) {
-            room.currentBet = amount;
-            const actualCost = Math.min(cost, p.chips);
-            p.chips -= actualCost; room.pot += actualCost; p.currentRoundBet += actualCost;
-            if (p.chips === 0) p.state = 'all-in';
-            io.to(room.code).emit('game:action', { playerId: p.id, name: p.name, action: 'raise', amount, publicState: publicRoomState(room) });
-            advanceTurn(room, io);
-          } else advanceTurn(room, io);
+          if (!amount || isNaN(amount) || amount < minRaise || cost > p.chips) {
+            socket.emit('room:error', { message: 'Invalid raise amount' });
+            const activeCount = gameEngine.countActivePlayers(room.players);
+            const options = {
+              canCall: true, canRaise: true, canFold: true,
+              canShow: activeCount === 2 && p.state === 'seen',
+              canSideshow: activeCount >= 3 && gameEngine.canSideshow(room, p.id),
+              isBlind: p.state === 'blind',
+              currentBet: room.currentBet,
+              callAmount: gameEngine.getMinBet(p.state === 'blind', room.currentBet),
+              minRaise: room.currentBet * 2,
+              myChips: p.chips,
+            };
+            socket.emit('game:yourTurn', { options, timeLimit: 35, turnTime: 35 });
+            startTurnTimer(room, io);
+            return;
+          }
+          room.currentBet = amount;
+          const actualCost = Math.min(cost, p.chips);
+          p.chips -= actualCost; room.pot += actualCost; p.currentRoundBet += actualCost;
+          if (p.chips === 0) p.state = 'all-in';
+          io.to(room.code).emit('game:action', { playerId: p.id, name: p.name, action: 'raise', amount, publicState: publicRoomState(room) });
+          advanceTurn(room, io);
         } else if (type === 'show') {
            if (gameEngine.countActivePlayers(room.players) === 2 && p.state === 'seen') {
              const cost = room.currentBet * 2;
@@ -245,7 +342,8 @@ io.on('connection', (socket) => {
              endRound(room, io);
            } else advanceTurn(room, io);
         } else if (type === 'sideshow_request') {
-           if (gameEngine.canSideshow(room, p.id)) {
+           const activeCount = gameEngine.countActivePlayers(room.players);
+           if (activeCount >= 3 && gameEngine.canSideshow(room, p.id)) {
              let prevIdx = (room.currentPlayerIndex - 1 + room.players.length) % room.players.length;
              while(room.players[prevIdx].state === 'folded') prevIdx = (prevIdx - 1 + room.players.length) % room.players.length;
              const target = room.players[prevIdx];
@@ -258,14 +356,30 @@ io.on('connection', (socket) => {
                 room.sideshowPending = null;
                 advanceTurn(room, io);
              }, 15000);
-           } else advanceTurn(room, io);
+           } else {
+             socket.emit('room:error', { message: 'Sideshow requires at least 3 active players' });
+             const options = {
+               canCall: true, canRaise: true, canFold: true,
+               canShow: activeCount === 2 && p.state === 'seen',
+               canSideshow: activeCount >= 3 && gameEngine.canSideshow(room, p.id),
+               isBlind: p.state === 'blind',
+               currentBet: room.currentBet,
+               callAmount: gameEngine.getMinBet(p.state === 'blind', room.currentBet),
+               minRaise: room.currentBet * 2,
+               myChips: p.chips,
+             };
+             socket.emit('game:yourTurn', { options, timeLimit: 35, turnTime: 35 });
+             startTurnTimer(room, io);
+           }
         }
         break;
       }
     }
   });
 
-  socket.on('game:sideshow_respond', ({ accept }) => {
+  socket.on('game:sideshow_respond', (data) => {
+    const payload = (data && typeof data === 'object') ? data : {};
+    const accept = Boolean(payload.accept);
     for (const room of rooms.values()) {
       if (room.sideshowPending && room.sideshowPending.targetId === socket.id) {
         clearSideshowTimer(room);
@@ -289,7 +403,9 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('chat:send', ({ text }) => {
+  socket.on('chat:send', (data) => {
+    const payload = (data && typeof data === 'object') ? data : {};
+    const text = typeof payload.text === 'string' ? payload.text.trim() : '';
     if (text && text.length <= 200) {
       for (const room of rooms.values()) {
         const p = room.players.find(p => p.id === socket.id);
@@ -303,9 +419,16 @@ io.on('connection', (socket) => {
       const pIdx = room.players.findIndex(p => p.id === socket.id);
       if (pIdx !== -1) {
         if (room.phase === 'waiting') {
+          const wasHost = (room.host === socket.id);
           room.players.splice(pIdx, 1);
-          if (room.players.length === 0) rooms.delete(room.code);
-          else io.to(room.code).emit('room:updated', publicRoomState(room));
+          if (room.players.length === 0) {
+            rooms.delete(room.code);
+          } else {
+            if (wasHost) {
+              room.host = room.players[0].id;
+            }
+            io.to(room.code).emit('room:updated', publicRoomState(room));
+          }
         } else if (room.phase === 'betting') {
           const p = room.players[pIdx];
           p.connected = false; p.state = 'folded';
@@ -321,8 +444,12 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-if (!process.env.VERCEL) {
+if (require.main === module && !process.env.VERCEL) {
   server.listen(PORT, () => { console.log(`Server listening on port ${PORT}`); });
 }
+
+app.server = server;
+app.io = io;
+app.rooms = rooms;
 
 module.exports = app;

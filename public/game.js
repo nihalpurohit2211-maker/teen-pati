@@ -689,6 +689,16 @@ function initUI() {
     const name = document.getElementById('input-name')?.value.trim();
     if (!name) { showError('lobby-error', 'Please enter your name!'); return; }
     state.myName = name;
+    if (!state.socket || !state.socket.connected) {
+      showError('lobby-error', 'Connecting to server... Please wait a moment.');
+      const btn = document.getElementById('btn-create');
+      if (btn) btn.textContent = 'Connecting...';
+      state.socket?.once('connect', () => {
+        if (btn) btn.textContent = 'Create Room';
+        state.socket.emit('room:create', { name });
+      });
+      return;
+    }
     state.socket.emit('room:create', { name });
   });
 
@@ -698,6 +708,16 @@ function initUI() {
     if (!name) { showError('lobby-error', 'Please enter your name!'); return; }
     if (!code || code.length !== 4) { showError('lobby-error', 'Enter a valid 4-letter room code!'); return; }
     state.myName = name;
+    if (!state.socket || !state.socket.connected) {
+      showError('lobby-error', 'Connecting to server... Please wait a moment.');
+      const btn = document.getElementById('btn-join');
+      if (btn) btn.textContent = 'Connecting...';
+      state.socket?.once('connect', () => {
+        if (btn) btn.textContent = 'Join Room';
+        state.socket.emit('room:join', { code, name });
+      });
+      return;
+    }
     state.socket.emit('room:join', { code, name });
   });
 
