@@ -471,10 +471,39 @@ function showWinOverlay(winnerId, winnerName, winnerHand, allHands, pot) {
   overlay.style.display = 'flex';
 }
 
+function getBackendUrl() {
+  const urlParams = new URLSearchParams(window.location.search);
+  const paramUrl = urlParams.get('server');
+  if (paramUrl) {
+    localStorage.setItem('teen_patti_backend', paramUrl);
+    return paramUrl;
+  }
+  const saved = localStorage.getItem('teen_patti_backend');
+  if (saved) return saved;
+  if (window.location.hostname.includes('vercel.app')) {
+    return 'https://teen-pati.onrender.com';
+  }
+  return undefined;
+}
+
 // --- Socket.io Event Handlers ---
 function initSocket() {
-  state.socket = io();
+  const backend = getBackendUrl();
+  state.socket = backend ? io(backend, { transports: ['websocket', 'polling'] }) : io();
   const socket = state.socket;
+
+  socket.on('connect', () => {
+    const statusEl = document.getElementById('connection-status');
+    if (statusEl) statusEl.style.display = 'none';
+  });
+
+  socket.on('connect_error', () => {
+    const statusEl = document.getElementById('connection-status');
+    if (statusEl) {
+      statusEl.textContent = 'Connecting to backend... (If Render just started, it takes ~30s to wake up)';
+      statusEl.style.display = 'block';
+    }
+  });
 
   socket.on('room:joined', ({ room, playerId, isHost }) => {
     state.myId = playerId;
@@ -641,6 +670,21 @@ function updateGameState(publicState) {
 
 // --- Event Listeners (DOM) ---
 function initUI() {
+  const currentBackend = getBackendUrl();
+  const backendDisplay = document.getElementById('current-backend-display');
+  if (backendDisplay) backendDisplay.textContent = currentBackend || 'Same Host';
+  document.getElementById('btn-change-server')?.addEventListener('click', () => {
+    const newUrl = prompt('Enter your Render backend URL (e.g. https://teen-pati.onrender.com):', currentBackend || 'https://teen-pati.onrender.com');
+    if (newUrl !== null) {
+      if (newUrl.trim()) {
+        localStorage.setItem('teen_patti_backend', newUrl.trim().replace(/\/+$/, ''));
+      } else {
+        localStorage.removeItem('teen_patti_backend');
+      }
+      window.location.reload();
+    }
+  });
+
   document.getElementById('btn-create')?.addEventListener('click', () => {
     const name = document.getElementById('input-name')?.value.trim();
     if (!name) { showError('lobby-error', 'Please enter your name!'); return; }

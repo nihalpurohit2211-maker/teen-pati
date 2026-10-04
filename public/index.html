@@ -8,7 +8,12 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;700&family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/gsap.min.js"></script>
-  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <script src="socket.io.min.js"></script>
+  <script>
+    if (typeof io === 'undefined') {
+      document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"><\\/script>');
+    }
+  </script>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -30,6 +35,11 @@
       </div>
       
       <p class="small-text">Have a link? Just open it!</p>
+      <div id="connection-status" style="display: none; color: #f0c040; font-size: 0.8rem; margin-top: 10px; text-align: center;"></div>
+      <div id="backend-config" style="margin-top: 15px; font-size: 0.75rem; color: #a09880; text-align: center;">
+        Server: <span id="current-backend-display" style="color: #f0c040;">Default</span>
+        <button id="btn-change-server" style="background: none; border: none; color: #f0c040; cursor: pointer; text-decoration: underline; font-size: 0.75rem; margin-left: 5px;">Change</button>
+      </div>
       <div id="lobby-error" style="display: none; color: #ff6b6b; margin-top: 10px;"></div>
     </div>
   </div>
